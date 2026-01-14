@@ -2,5 +2,5 @@ __pycache__/
 *.pyc
 .env
 .venv/
-models/ai/*.onnx
+api/models/ai/*.onnx
 *.onnx

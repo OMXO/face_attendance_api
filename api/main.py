@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timezone
 from typing import Dict, Any
 
 from dotenv import load_dotenv
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from api.model_assets import ensure_models
 from api.routes import employees, faces, logs, cameras, recognize, schedules  # ✅ add schedules
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=True)
 
 app = FastAPI(title="Face Attendance API")
 
@@ -37,3 +40,10 @@ def root() -> Dict[str, Any]:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+
+@app.on_event("startup")
+def _startup():
+    print("ARC_MODEL_URL:", os.getenv("ARC_MODEL_URL"))
+    print("RETINA_MODEL_URL:", os.getenv("RETINA_MODEL_URL"))
+    print("MODELS_DIR:", os.getenv("MODELS_DIR"))
+    ensure_models()

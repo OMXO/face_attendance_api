@@ -1,7 +1,9 @@
 import os
-from supabase import create_client, Client
+from typing import Optional
+from supabase import Client
 
-_supabase: Client | None = None
+_supabase: Optional[Client] = None
+
 
 def get_supabase() -> Client:
     global _supabase

@@ -1,88 +1,90 @@
 from __future__ import annotations
+from typing import Any, List, Optional
 
-from typing import Any, Optional, List
-
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
-
+from fastapi import APIRouter, HTTPException, Query
 from api.supabase_client import get_supabase
-from api.schemas import FaceEmbeddingUpsertRequest, FaceEmbeddingResponse
-from api.embedding import get_embedding_from_image_bytes
+from api.schemas import (
+    EmployeeCreateRequest,
+    EmployeeUpdateRequest,
+    EmployeeResponse,
+)
 
-router = APIRouter(prefix="/faces", tags=["faces"])
-
-
-def _raise_if_error(resp: Any, msg: str) -> None:
-    err = getattr(resp, "error", None)
-    if err:
-        raise HTTPException(status_code=500, detail=f"{msg}: {err}")
+router = APIRouter(prefix="/employees", tags=["employees"])
 
 
-@router.get("", response_model=List[FaceEmbeddingResponse])
-def list_faces(limit: int = Query(default=200, ge=1, le=2000)) -> Any:
+def _err(resp, msg: str):
+    if resp.error:
+        raise HTTPException(500, f"{msg}: {resp.error}")
+
+
+@router.get("", response_model=List[EmployeeResponse])
+def list_employees(
+    q: Optional[str] = Query(None),
+    is_active: Optional[bool] = Query(None),
+    limit: int = 200,
+):
     sb = get_supabase()
-    resp = sb.table("face_embeddings").select("*").limit(limit).execute()
-    _raise_if_error(resp, "Failed to list face embeddings")
+    qy = sb.table("employees").select("*").limit(limit)
+
+    if is_active is not None:
+        qy = qy.eq("is_active", is_active)
+
+    if q:
+        qy = qy.or_(f"name.ilike.%{q}%,employee_code.ilike.%{q}%")
+
+    resp = qy.execute()
+    _err(resp, "list employees")
     return resp.data or []
 
 
-@router.get("/{employee_id}", response_model=FaceEmbeddingResponse)
-def get_face(employee_id: int) -> Any:
+@router.get("/{employee_id}", response_model=EmployeeResponse)
+def get_employee(employee_id: int):
     sb = get_supabase()
-    resp = sb.table("face_embeddings").select("*").eq("employee_id", employee_id).maybe_single().execute()
-    _raise_if_error(resp, "Failed to get face embedding")
+    resp = (
+        sb.table("employees")
+        .select("*")
+        .eq("employee_id", employee_id)
+        .maybe_single()
+        .execute()
+    )
+    _err(resp, "get employee")
     if not resp.data:
-        raise HTTPException(status_code=404, detail="Face embedding not found")
+        raise HTTPException(404, "Employee not found")
     return resp.data
 
 
-@router.put("/{employee_id}", response_model=FaceEmbeddingResponse)
-def upsert_face(employee_id: int, payload: FaceEmbeddingUpsertRequest) -> Any:
-    """
-    Upsert face embedding row (employee_id is PK).
-    """
+@router.post("", response_model=EmployeeResponse)
+def create_employee(body: EmployeeCreateRequest):
     sb = get_supabase()
-    body = payload.model_dump(exclude_none=True)
-    body["employee_id"] = employee_id
+    resp = sb.table("employees").insert(body.model_dump(exclude_none=True)).execute()
+    _err(resp, "create employee")
+    return resp.data[0]
 
-    resp = sb.table("face_embeddings").upsert(body).execute()
-    _raise_if_error(resp, "Failed to upsert face embedding")
+
+@router.patch("/{employee_id}", response_model=EmployeeResponse)
+def update_employee(employee_id: int, body: EmployeeUpdateRequest):
+    data = body.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(400, "No update fields")
+
+    sb = get_supabase()
+    resp = (
+        sb.table("employees")
+        .update(data)
+        .eq("employee_id", employee_id)
+        .execute()
+    )
+    _err(resp, "update employee")
     if not resp.data:
-        raise HTTPException(status_code=500, detail="Upsert succeeded but returned no data")
+        raise HTTPException(404, "Employee not found")
     return resp.data[0]
 
 
 @router.delete("/{employee_id}")
-def delete_face(employee_id: int) -> Any:
+def delete_employee(employee_id: int):
     sb = get_supabase()
-    resp = sb.table("face_embeddings").delete().eq("employee_id", employee_id).execute()
-    _raise_if_error(resp, "Failed to delete face embedding")
+    resp = sb.table("employees").delete().eq("employee_id", employee_id).execute()
+    _err(resp, "delete employee")
     if not resp.data:
-        raise HTTPException(status_code=404, detail="Face embedding not found or already deleted")
-    return {"ok": True, "deleted": resp.data[0]}
-
-
-@router.post("/enroll/{employee_id}")
-async def enroll_face(employee_id: int, file: UploadFile = File(...)) -> Any:
-    """
-    Compute embedding from uploaded image, then upsert into face_embeddings.
-    """
-    img_bytes = await file.read()
-    if not img_bytes:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    emb = get_embedding_from_image_bytes(img_bytes)  # should return list[float] or numpy array
-
-    sb = get_supabase()
-    body = {
-        "employee_id": employee_id,
-        "embedding_dim": 512,
-        "model_name": "arcface",
-        "model_version": "onnx",
-        "embedding": emb,
-    }
-    resp = sb.table("face_embeddings").upsert(body).execute()
-    _raise_if_error(resp, "Failed to enroll face embedding")
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Enroll succeeded but returned no data")
-
-    return {"ok": True, "employee_id": employee_id, "face_embedding": resp.data[0]}
+        raise HTTPException(404, "Employee not found")
+    return {"ok": True}

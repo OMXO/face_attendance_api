@@ -1,94 +1,69 @@
 from __future__ import annotations
+from typing import Any, List
 
-from typing import Any, Optional, List
-
-from fastapi import APIRouter, HTTPException, Query
-
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from api.supabase_client import get_supabase
-from api.schemas import (
-    AttendanceLogCreateRequest,
-    AttendanceLogUpdateRequest,
-    AttendanceLogResponse,
-)
+from api.embedding import get_embedding_from_image_bytes
 
-router = APIRouter(prefix="/logs", tags=["logs"])
+router = APIRouter(prefix="/faces", tags=["faces"])
 
 
-def _raise_if_error(resp: Any, msg: str) -> None:
-    err = getattr(resp, "error", None)
-    if err:
-        raise HTTPException(status_code=500, detail=f"{msg}: {err}")
+def _err(resp, msg: str):
+    if resp.error:
+        raise HTTPException(500, f"{msg}: {resp.error}")
 
 
-@router.get("", response_model=List[AttendanceLogResponse])
-def list_logs(
-    employee_id: Optional[int] = Query(default=None),
-    camera_id: Optional[str] = Query(default=None),
-    event_type: Optional[str] = Query(default=None),
-    recognized: Optional[bool] = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=2000),
-    order_desc: bool = Query(default=True),
-) -> Any:
+@router.get("")
+def list_faces(limit: int = 200) -> List[Any]:
     sb = get_supabase()
-    query = sb.table("attendance_logs").select("*").limit(limit)
-
-    if employee_id is not None:
-        query = query.eq("employee_id", employee_id)
-    if camera_id is not None:
-        query = query.eq("camera_id", camera_id)
-    if event_type is not None:
-        query = query.eq("event_type", event_type)
-    if recognized is not None:
-        query = query.eq("recognized", recognized)
-
-    query = query.order("event_time", desc=order_desc)
-
-    resp = query.execute()
-    _raise_if_error(resp, "Failed to list logs")
+    resp = sb.table("face_embeddings").select("*").limit(limit).execute()
+    _err(resp, "list faces")
     return resp.data or []
 
 
-@router.get("/{log_id}", response_model=AttendanceLogResponse)
-def get_log(log_id: int) -> Any:
+@router.get("/{employee_id}")
+def get_face(employee_id: int):
     sb = get_supabase()
-    resp = sb.table("attendance_logs").select("*").eq("log_id", log_id).maybe_single().execute()
-    _raise_if_error(resp, "Failed to get log")
+    resp = (
+        sb.table("face_embeddings")
+        .select("*")
+        .eq("employee_id", employee_id)
+        .maybe_single()
+        .execute()
+    )
+    _err(resp, "get face")
     if not resp.data:
-        raise HTTPException(status_code=404, detail="Log not found")
+        raise HTTPException(404, "Face not found")
     return resp.data
 
 
-@router.post("", response_model=AttendanceLogResponse)
-def create_log(payload: AttendanceLogCreateRequest) -> Any:
+@router.post("/enroll/{employee_id}")
+async def enroll_face(employee_id: int, file: UploadFile = File(...)):
+    img = await file.read()
+    if not img:
+        raise HTTPException(400, "Empty image")
+
+    emb = get_embedding_from_image_bytes(img)
+
     sb = get_supabase()
-    data = payload.model_dump(exclude_none=True)
+    body = {
+        "employee_id": employee_id,
+        "embedding_dim": 512,
+        "model_name": "arcface",
+        "model_version": "onnx",
+        "embedding": emb,
+    }
+    resp = sb.table("face_embeddings").upsert(body).execute()
+    _err(resp, "enroll face")
 
-    resp = sb.table("attendance_logs").insert(data).execute()
-    _raise_if_error(resp, "Failed to create log")
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Insert succeeded but returned no data")
-    return resp.data[0]
+    return {"ok": True, "employee_id": employee_id}
 
 
-@router.patch("/{log_id}", response_model=AttendanceLogResponse)
-def update_log(log_id: int, payload: AttendanceLogUpdateRequest) -> Any:
+@router.delete("/{employee_id}")
+def delete_face(employee_id: int):
     sb = get_supabase()
-    data = payload.model_dump(exclude_none=True)
-    if not data:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    resp = sb.table("attendance_logs").update(data).eq("log_id", log_id).execute()
-    _raise_if_error(resp, "Failed to update log")
+    resp = sb.table("face_embeddings").delete().eq("employee_id", employee_id).execute()
+    _err(resp, "delete face")
     if not resp.data:
-        raise HTTPException(status_code=404, detail="Log not found")
-    return resp.data[0]
-
-
-@router.delete("/{log_id}")
-def delete_log(log_id: int) -> Any:
-    sb = get_supabase()
-    resp = sb.table("attendance_logs").delete().eq("log_id", log_id).execute()
-    _raise_if_error(resp, "Failed to delete log")
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Log not found or already deleted")
-    return {"ok": True, "deleted": resp.data[0]}
+        raise HTTPException(404, "Face not found")
+    return {"ok": True}

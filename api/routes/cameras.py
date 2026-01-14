@@ -1,3 +1,4 @@
+# api/routes/cameras.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -10,17 +11,12 @@ router = APIRouter(prefix="/cameras", tags=["cameras"])
 
 
 class CameraCreateRequest(BaseModel):
-    camera_id: Optional[str] = Field(default=None, description="Human readable camera id")
-    name: str = Field(..., min_length=1)
+    camera_id: str = Field(..., description="Camera primary key (text)")
     is_active: bool = True
 
-
-class CameraResponse(BaseModel):
-    id: int
-    camera_id: Optional[str] = None
-    name: str
-    is_active: bool = True
-    updated_at: Optional[str] = None
+    # UI 호환용(DB에는 없음) - 들어와도 무시/호환 처리
+    name: Optional[str] = None
+    location: Optional[str] = None
 
 
 def _raise_if_error(resp: Any, msg: str) -> None:
@@ -29,26 +25,49 @@ def _raise_if_error(resp: Any, msg: str) -> None:
         raise HTTPException(status_code=500, detail=f"{msg}: {err}")
 
 
+def _decorate(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    DB에는 없는 필드를 응답에만 붙여서 UI가 기대하는 키를 유지
+    """
+    camera_id = row.get("camera_id")
+    row["name"] = row.get("name") or camera_id          # fallback
+    row["location"] = row.get("location") or None       # fallback
+    return row
+
+
 @router.get("")
-def list_cameras(limit: int = 100) -> Any:
+def list_cameras(limit: int = 200) -> Any:
     sb = get_supabase()
     resp = sb.table("cameras").select("*").limit(limit).execute()
     _raise_if_error(resp, "Failed to list cameras")
-    return resp.data or []
+
+    data = resp.data or []
+    return [_decorate(r) for r in data]
 
 
 @router.post("")
 def create_camera(req: CameraCreateRequest) -> Any:
     sb = get_supabase()
-    payload = req.model_dump()
+
+    # DB에 실제 존재하는 컬럼만 insert
+    payload = {"camera_id": req.camera_id, "is_active": req.is_active}
+
     resp = sb.table("cameras").insert(payload).execute()
     _raise_if_error(resp, "Failed to create camera")
-    return (resp.data or [{}])[0]
+
+    row = (resp.data or [{}])[0]
+    return _decorate(row)
 
 
-@router.patch("/{id}")
-def update_camera(id: int, patch: Dict[str, Any]) -> Any:
+@router.patch("/{camera_id}")
+def update_camera(camera_id: str, patch: Dict[str, Any]) -> Any:
     sb = get_supabase()
-    resp = sb.table("cameras").update(patch).eq("id", id).execute()
+
+    # DB에 실제 존재하는 컬럼만 update 허용
+    safe_patch = {k: v for k, v in patch.items() if k in {"is_active"}}
+
+    resp = sb.table("cameras").update(safe_patch).eq("camera_id", camera_id).execute()
     _raise_if_error(resp, "Failed to update camera")
-    return (resp.data or [{}])[0]
+
+    row = (resp.data or [{}])[0]
+    return _decorate(row)

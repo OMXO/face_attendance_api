@@ -19,5 +19,5 @@ COPY . /app
 # 기본 포트
 EXPOSE 8000
 
-# 프로덕션 실행 (reload 없음)
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# (기존 Dockerfile 맨 아래)
+CMD ["bash", "-lc", "python scripts/fetch_models.py && uvicorn api.main:app --host 0.0.0.0 --port 8000"]

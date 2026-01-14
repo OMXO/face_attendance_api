@@ -1,8 +1,9 @@
+# api/routes/logs.py
 from __future__ import annotations
 
 from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from api.supabase_client import get_supabase
 
@@ -15,23 +16,30 @@ def _raise_if_error(resp: Any, msg: str) -> None:
         raise HTTPException(status_code=500, detail=f"{msg}: {err}")
 
 
-class LogResponse(BaseModel):
+class LogRow(BaseModel):
     log_id: int
-    employee_id: int
+    event_time: str
     event_type: str
-    camera_id: Optional[str] = None
-    score: Optional[float] = None
-    created_at: Optional[str] = None
+    camera_id: str
+    recognized: bool
+    similarity: Optional[float] = None
+    employee_id: Optional[int] = None
+    created_at: str
 
 
-@router.get("")
+@router.get("", response_model=list[LogRow])
 def list_logs(
     limit: int = Query(default=200, ge=1, le=500),
     employee_id: Optional[int] = Query(default=None),
 ) -> Any:
     sb = get_supabase()
 
-    q = sb.table("attendance_logs").select("*").order("created_at", desc=True).limit(limit)
+    q = (
+        sb.table("attendance_logs")
+        .select("log_id,event_time,event_type,camera_id,recognized,similarity,employee_id,created_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
     if employee_id is not None:
         q = q.eq("employee_id", employee_id)
 

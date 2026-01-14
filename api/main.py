@@ -11,6 +11,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+import traceback
+
 from api.model_assets import ensure_models
 from api.routes import employees, faces, logs, cameras, recognize, schedules
 
@@ -78,3 +80,15 @@ def __version() -> Dict[str, Any]:
 def _startup():
     # 모델 파일 확보 (다운로드/캐시)
     ensure_models()
+
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "msg": "unhandled server error",
+            "error": repr(exc),
+            "trace": traceback.format_exc()[-2500:],
+            "path": str(request.url),
+        },
+    )

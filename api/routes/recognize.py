@@ -4,16 +4,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
+import traceback
 import numpy as np
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
 from api.supabase_client import get_supabase
 from api.embedding import get_embedding_from_image_bytes
-import traceback
 
 router = APIRouter(tags=["recognize"])
 
-# ✅ event_type enum 방어
+# ✅ DB enum(event_type)에 맞춰 강제 통일
 VALID_EVENT_TYPES = {"CHECK_IN", "CHECK_OUT"}
 
 
@@ -23,16 +23,14 @@ VALID_EVENT_TYPES = {"CHECK_IN", "CHECK_OUT"}
 def _raise_if_error(resp: Any, msg: str) -> None:
     """
     supabase-py 응답에서 error가 있으면 FastAPI 예외로 변환.
-    Render에서 원인 파악이 되도록 detail을 더 풍부하게 보여줌.
+    (Render에서도 원인 파악 가능하도록 detail 풍부하게)
     """
     err = getattr(resp, "error", None)
     if err:
-        # ✅ err가 dict/string 등 다양하므로 repr로 최대한 보존
         raise HTTPException(status_code=500, detail={"msg": msg, "error": repr(err)})
 
 
 def _normalize_event_type(v: str) -> str:
-    # ✅ UI/Swagger/다른 호출에서 check_in/check-out 같은 값이 와도 통일
     raw = (v or "").strip()
     up = raw.upper()
 
@@ -57,14 +55,15 @@ def _parse_pgvector(v: Any) -> Optional[np.ndarray]:
     """
     if v is None:
         return None
+
     if isinstance(v, list):
         try:
             return np.asarray(v, dtype=np.float32)
         except Exception:
             return None
+
     if isinstance(v, str):
         s = v.strip()
-        # "[0.1,0.2,...]" 형태
         if s.startswith("[") and s.endswith("]"):
             s = s[1:-1].strip()
         if not s:
@@ -74,11 +73,12 @@ def _parse_pgvector(v: Any) -> Optional[np.ndarray]:
             return arr if arr.size > 0 else None
         except Exception:
             return None
+
     return None
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
     if denom == 0:
         return -1.0
     return float(np.dot(a, b) / denom)
@@ -87,7 +87,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 def _ensure_camera_exists(camera_id: str) -> None:
     """
     attendance_logs.camera_id는 cameras.camera_id FK라서
-    camera가 없으면 log insert가 무조건 실패함.
+    camera가 없으면 log insert가 실패.
     -> recognize에서 미리 upsert로 보장.
     """
     sb = get_supabase()
@@ -100,9 +100,6 @@ def _ensure_camera_exists(camera_id: str) -> None:
 
 
 def _fetch_all_embeddings(limit: int = 2000) -> List[Dict[str, Any]]:
-    """
-    MVP: 전체 직원 임베딩을 가져와 python에서 매칭
-    """
     sb = get_supabase()
     resp = (
         sb.table("face_embeddings")
@@ -148,10 +145,10 @@ def _insert_attendance_log(
         "created_at": now,
     }
 
+    # ✅ postgrest.exceptions.APIError 같은 건 execute에서 "예외"로 터질 수 있음
     try:
         resp = sb.table("attendance_logs").insert(payload).execute()
     except Exception as e:
-        # ✅ postgrest exceptions 등 여기서 직접 터지는 케이스도 잡아서 원인 노출
         raise HTTPException(
             status_code=500,
             detail={"msg": "Failed to insert attendance log (exception)", "error": repr(e)},
@@ -224,7 +221,6 @@ async def recognize(
                 continue
             if emb.shape[0] != query_emb.shape[0]:
                 continue
-
             sim = _cosine_similarity(query_emb, emb)
             if sim > best_sim:
                 best_sim = sim
@@ -232,12 +228,14 @@ async def recognize(
 
         recognized = bool(best_emp_id is not None and best_sim >= float(threshold))
 
+        # 4) 직원 정보 + (원하면 비활성 제외)
         emp_brief: Dict[str, Any] = {}
         if recognized and best_emp_id is not None:
             emp_brief = _fetch_employee_brief(int(best_emp_id))
             if emp_brief.get("is_active") is False:
                 recognized = False
 
+        # 5) 로그 저장
         log_row = _insert_attendance_log(
             event_type=event_type,
             camera_id=camera_id,
@@ -260,16 +258,14 @@ async def recognize(
         }
 
     except HTTPException:
-        # ✅ 이미 우리가 의도적으로 만든 에러는 그대로 전달
         raise
     except Exception as e:
-        # ✅ 여기로 오면 "원래 Internal Server Error로 뭉개지던" 진짜 원인
         tb = traceback.format_exc()
         raise HTTPException(
             status_code=500,
             detail={
                 "msg": "recognize crashed (unhandled exception)",
                 "error": repr(e),
-                "trace": tb[-2500:],  # 너무 길면 마지막만
+                "trace": tb[-2500:],
             },
         )

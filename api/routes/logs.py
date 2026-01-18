@@ -28,7 +28,7 @@ def list_logs(
     sb = get_supabase()
 
     def _run():
-        q = sb.table("attendance_logs").select("*").limit(limit)
+        q = sb.table("attendance_logs").select("*, employees(name, employee_code)").limit(limit)
         if employee_id is not None:
             q = q.eq("employee_id", employee_id)
         if camera_id is not None:
@@ -41,7 +41,16 @@ def list_logs(
         return q.execute()
 
     resp = execute_or_500(_run, "list logs")
-    return get_data(resp)
+    data = get_data(resp)
+    
+    # Flatten the join for the UI
+    for row in data:
+        emp = row.get("employees")
+        if emp:
+            row["name"] = emp.get("name")
+            row["employee_code"] = emp.get("employee_code")
+            
+    return data
 
 
 @router.get("/{log_id}", response_model=AttendanceLogResponse)

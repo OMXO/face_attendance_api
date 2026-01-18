@@ -1,271 +1,122 @@
-# api/routes/recognize.py
 from __future__ import annotations
-
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List
-
-import traceback
+import cv2
 import numpy as np
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, UploadFile, File, Form
+from typing import Dict
 
 from api.supabase_client import get_supabase
-from api.embedding import get_embedding_from_image_bytes
+from api.models.face_models import detect_faces, get_embedding, safe_crop
 
-router = APIRouter(tags=["recognize"])
+router = APIRouter(prefix="/recognize", tags=["recognition"])
 
-# ✅ DB enum(event_type)에 맞춰 강제 통일
-VALID_EVENT_TYPES = {"CHECK_IN", "CHECK_OUT"}
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def _raise_if_error(resp: Any, msg: str) -> None:
-    """
-    supabase-py 응답에서 error가 있으면 FastAPI 예외로 변환.
-    (Render에서도 원인 파악 가능하도록 detail 풍부하게)
-    """
-    err = getattr(resp, "error", None)
-    if err:
-        raise HTTPException(status_code=500, detail={"msg": msg, "error": repr(err)})
+# 🔑 CACHE: { emp_id: { "vec": ..., "name": ..., "code": ... } }
+KNOWN: Dict[int, Dict] = {}
 
 
-def _normalize_event_type(v: str) -> str:
-    raw = (v or "").strip()
-    up = raw.upper()
-
-    # 흔한 변형 흡수
-    if up in {"CHECKIN", "CHECK-IN", "CHECK_IN"}:
-        up = "CHECK_IN"
-    elif up in {"CHECKOUT", "CHECK-OUT", "CHECK_OUT"}:
-        up = "CHECK_OUT"
-
-    if up not in VALID_EVENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid event_type: {raw!r}. Use one of {sorted(VALID_EVENT_TYPES)}",
-        )
-    return up
-
-
-def _parse_pgvector(v: Any) -> Optional[np.ndarray]:
-    """
-    face_embeddings.embedding 이 pgvector일 가능성이 높음.
-    supabase python client에서 문자열/리스트 등으로 올 수 있어 방어적으로 파싱.
-    """
-    if v is None:
-        return None
-
-    if isinstance(v, list):
-        try:
-            return np.asarray(v, dtype=np.float32)
-        except Exception:
-            return None
-
-    if isinstance(v, str):
-        s = v.strip()
-        if s.startswith("[") and s.endswith("]"):
-            s = s[1:-1].strip()
-        if not s:
-            return None
-        try:
-            arr = np.fromstring(s, sep=",", dtype=np.float32)
-            return arr if arr.size > 0 else None
-        except Exception:
-            return None
-
-    return None
-
-
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return -1.0
-    return float(np.dot(a, b) / denom)
-
-
-def _ensure_camera_exists(camera_id: str) -> None:
-    """
-    attendance_logs.camera_id는 cameras.camera_id FK라서
-    camera가 없으면 log insert가 실패.
-    -> recognize에서 미리 upsert로 보장.
-    """
+def refresh_embeddings():
+    global KNOWN
     sb = get_supabase()
-    resp = (
-        sb.table("cameras")
-        .upsert({"camera_id": camera_id, "is_active": True}, on_conflict="camera_id")
-        .execute()
-    )
-    _raise_if_error(resp, "Failed to ensure camera exists")
 
+    # 1. Fetch face embeddings joined with persons
+    # (persons -> face_embeddings should exist via person_id)
+    rows = sb.table("face_embeddings") \
+        .select("embedding, persons!inner(employee_id, name)") \
+        .execute().data
 
-def _fetch_all_embeddings(limit: int = 2000) -> List[Dict[str, Any]]:
-    sb = get_supabase()
-    resp = (
-        sb.table("face_embeddings")
-        .select("employee_id, embedding_dim, embedding")
-        .limit(limit)
-        .execute()
-    )
-    _raise_if_error(resp, "Failed to fetch face embeddings")
-    return resp.data or []
+    if not rows:
+        KNOWN.clear()
+        print("ℹ️ No embeddings found in database.")
+        return
 
-
-def _fetch_employee_brief(employee_id: int) -> Dict[str, Any]:
-    sb = get_supabase()
-    resp = (
-        sb.table("employees")
-        .select("employee_id, name, employee_code, is_active")
-        .eq("employee_id", employee_id)
-        .single()
-        .execute()
-    )
-    _raise_if_error(resp, "Failed to fetch employee")
-    return resp.data or {}
-
-
-def _insert_attendance_log(
-    *,
-    event_type: str,
-    camera_id: str,
-    recognized: bool,
-    similarity: Optional[float],
-    employee_id: Optional[int],
-) -> Dict[str, Any]:
-    sb = get_supabase()
-    now = datetime.now(timezone.utc).isoformat()
-
-    payload: Dict[str, Any] = {
-        "event_time": now,
-        "event_type": event_type,
-        "camera_id": camera_id,
-        "recognized": recognized,
-        "similarity": similarity,
-        "employee_id": employee_id,
-        "created_at": now,
-    }
-
-    # ✅ postgrest.exceptions.APIError 같은 건 execute에서 "예외"로 터질 수 있음
+    # 2. Collect unique employee IDs (they might be strings in 'persons')
+    emp_ids_raw = list({r["persons"]["employee_id"] for r in rows if r.get("persons")})
+    
+    # 3. Fetch employee codes from employees table
+    # We fetch them separately to avoid join errors if foreign keys are missing
+    emp_meta = {}
     try:
-        resp = sb.table("attendance_logs").insert(payload).execute()
+        emp_resp = sb.table("employees") \
+            .select("employee_id, employee_code") \
+            .in_("employee_id", emp_ids_raw) \
+            .execute().data
+        for e in emp_resp:
+            emp_meta[str(e["employee_id"])] = e.get("employee_code")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"msg": "Failed to insert attendance log (exception)", "error": repr(e)},
-        )
+        print(f"⚠️ Could not fetch employee codes: {e}")
 
-    _raise_if_error(resp, "Failed to insert attendance log")
-    return (resp.data or [{}])[0]
-
-
-# -----------------------------
-# Route
-# -----------------------------
-@router.post("/recognize")
-async def recognize(
-    file: UploadFile = File(...),
-    event_type: str = Form(...),
-    camera_id: str = Form(...),
-    threshold: float = Form(0.35),
-) -> Dict[str, Any]:
-    try:
-        # ✅ 0) event_type normalize (DB enum 불일치 방지)
-        event_type = _normalize_event_type(event_type)
-
-        # 1) camera FK 보장
-        camera_id = (camera_id or "").strip()
-        if not camera_id:
-            raise HTTPException(status_code=400, detail="camera_id is required")
-        _ensure_camera_exists(camera_id)
-
-        # 2) 이미지 -> 임베딩
-        img_bytes = await file.read()
-        if not img_bytes:
-            raise HTTPException(status_code=400, detail="empty file")
-
-        try:
-            query_emb = get_embedding_from_image_bytes(img_bytes).astype(np.float32)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail={"msg": "embedding failed", "error": repr(e)})
-
-        # 3) DB 임베딩 fetch -> best match
-        rows = _fetch_all_embeddings(limit=2000)
-        if not rows:
-            log_row = _insert_attendance_log(
-                event_type=event_type,
-                camera_id=camera_id,
-                recognized=False,
-                similarity=None,
-                employee_id=None,
-            )
-            return {
-                "recognized": False,
-                "similarity": None,
-                "employee_id": None,
-                "name": None,
-                "employee_code": None,
-                "camera_id": camera_id,
-                "event_type": event_type,
-                "log_id": log_row.get("log_id"),
-                "event_time": log_row.get("event_time"),
-                "created_at": log_row.get("created_at"),
-                "message": "No enrolled faces found in DB.",
-            }
-
-        best_emp_id: Optional[int] = None
-        best_sim: float = -1.0
-
-        for r in rows:
-            emb = _parse_pgvector(r.get("embedding"))
-            if emb is None:
-                continue
-            if emb.shape[0] != query_emb.shape[0]:
-                continue
-            sim = _cosine_similarity(query_emb, emb)
-            if sim > best_sim:
-                best_sim = sim
-                best_emp_id = r.get("employee_id")
-
-        recognized = bool(best_emp_id is not None and best_sim >= float(threshold))
-
-        # 4) 직원 정보 + (원하면 비활성 제외)
-        emp_brief: Dict[str, Any] = {}
-        if recognized and best_emp_id is not None:
-            emp_brief = _fetch_employee_brief(int(best_emp_id))
-            if emp_brief.get("is_active") is False:
-                recognized = False
-
-        # 5) 로그 저장
-        log_row = _insert_attendance_log(
-            event_type=event_type,
-            camera_id=camera_id,
-            recognized=recognized,
-            similarity=float(best_sim) if best_sim >= -0.5 else None,
-            employee_id=int(best_emp_id) if recognized and best_emp_id is not None else None,
-        )
-
-        return {
-            "recognized": recognized,
-            "similarity": float(best_sim) if best_sim >= -0.5 else None,
-            "employee_id": emp_brief.get("employee_id") if recognized else None,
-            "name": emp_brief.get("name") if recognized else None,
-            "employee_code": emp_brief.get("employee_code") if recognized else None,
-            "camera_id": camera_id,
-            "event_type": event_type,
-            "log_id": log_row.get("log_id"),
-            "event_time": log_row.get("event_time"),
-            "created_at": log_row.get("created_at"),
+    # 4. Rebuild Cache
+    KNOWN.clear()
+    for r in rows:
+        p = r.get("persons")
+        if not p: continue
+        
+        raw_id = p["employee_id"]
+        emp_id = int(raw_id)
+        name = p.get("name") or "Unknown"
+        code = emp_meta.get(str(raw_id)) or f"ID-{emp_id}"
+        
+        vec_str = r["embedding"].strip("[]")
+        if not vec_str: continue
+        
+        vec = np.fromstring(vec_str, sep=",", dtype=np.float32)
+        KNOWN[emp_id] = {
+            "vec": vec / np.linalg.norm(vec),
+            "name": name,
+            "code": code
         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        tb = traceback.format_exc()
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "msg": "recognize crashed (unhandled exception)",
-                "error": repr(e),
-                "trace": tb[-2500:],
-            },
-        )
+    print(f"✅ Loaded {len(KNOWN)} embeddings with metadata")
+
+
+@router.post("/")
+async def recognize(
+    image: UploadFile = File(...),
+    event_type: str = Form(...),
+    camera_id: str = Form(...),
+):
+    if not KNOWN:
+        refresh_embeddings()
+
+    img = cv2.imdecode(np.frombuffer(await image.read(), np.uint8), cv2.IMREAD_COLOR)
+    faces = detect_faces(img)
+
+    if not faces:
+        return {"recognized": False}
+
+    faces.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    face = safe_crop(img, faces[0])
+    emb = get_embedding(face)
+    emb = emb / np.linalg.norm(emb)
+
+    best_id, best_score = None, -1
+    for eid, data in KNOWN.items():
+        ref = data["vec"]
+        s = float(np.dot(emb, ref))
+        if s > best_score:
+            best_id, best_score = eid, s
+
+    is_recognized = best_score >= 0.38
+    result = {
+        "recognized": is_recognized,
+        "employee_id": best_id,
+        "similarity": round(best_score, 4),
+    }
+
+    if is_recognized and best_id in KNOWN:
+        result["name"] = KNOWN[best_id]["name"]
+        result["employee_code"] = KNOWN[best_id]["code"]
+
+        # 🕒 LOG ATTENDANCE (Optional: call logs route or insert here)
+        try:
+            sb = get_supabase()
+            sb.table("attendance_logs").insert({
+                "employee_id": best_id,
+                "camera_id": camera_id,
+                "event_type": event_type,
+                "recognized": True,
+                "similarity": round(best_score, 4)
+            }).execute()
+        except Exception as e:
+            print(f"❌ Failed to log attendance: {e}")
+
+    return result
